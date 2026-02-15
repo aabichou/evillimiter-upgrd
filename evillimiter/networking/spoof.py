@@ -15,7 +15,7 @@ from evillimiter.common.globals import BROADCAST
 
 
 class ARPSpoofer(object):
-    def __init__(self, interface, gateway_ip, gateway_mac, interval=0.2, burst_count=10):
+    def __init__(self, interface, gateway_ip, gateway_mac, interval=0.1, burst_count=15):
         self.interface = interface
         self.gateway_ip = gateway_ip
         self.gateway_mac = gateway_mac
@@ -24,11 +24,11 @@ class ARPSpoofer(object):
         self._attacker_mac = get_if_hwaddr(interface)
 
         # interval in seconds between spoofed ARP packet cycles
-        # 0.2s = 5 cycles/sec — aggressive enough to outpace 5G router ARP re-verification
+        # 0.1s = 10 cycles/sec — very aggressive, outpaces IndiHome router ARP refresh
         self.interval = interval
 
         # number of times each ARP packet is sent per cycle
-        # 10× burst to overwhelm router's ARP cache before it can re-learn
+        # 15× burst — overwhelms router's ARP cache entry before re-learn
         self.burst_count = burst_count
 
         # derive gateway's IPv6 link-local address from its MAC (EUI-64)
@@ -36,8 +36,8 @@ class ARPSpoofer(object):
         self._gateway_ipv6_ll = self._mac_to_ipv6_linklocal(gateway_mac)
 
         # send RA kill packets every N ARP cycles (RA doesn't need to be as frequent)
-        # with interval=0.5s and ra_every=4, RA is sent every 2 seconds
-        self._ra_every = 4
+        # with interval=0.1s and ra_every=6, RA is sent every 0.6 seconds
+        self._ra_every = 6
         self._ra_cycle = 0
 
         self._hosts = set()

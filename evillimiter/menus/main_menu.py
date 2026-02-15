@@ -31,6 +31,9 @@ class MainMenu(CommandMenu):
 
         scan_parser = self.parser.add_subparser('scan', self._scan_handler)
         scan_parser.add_parameterized_flag('--range', 'iprange')
+        scan_parser.add_flag('--quick', 'quick')
+
+        rescan_parser = self.parser.add_subparser('rescan', self._rescan_handler)
 
         limit_parser = self.parser.add_subparser('limit', self._limit_handler)
         limit_parser.add_parameter('id')
@@ -120,7 +123,8 @@ class MainMenu(CommandMenu):
     def _scan_handler(self, args):
         """
         Handles 'scan' command-line argument
-        (Re)scans for hosts on the network
+        (Re)scans for hosts on the network using deep multi-pass scan
+        Use --quick for a fast single-pass scan
         """
         if args.iprange:
             iprange = self._parse_iprange(args.iprange)
@@ -133,12 +137,52 @@ class MainMenu(CommandMenu):
         with self.hosts_lock:
             for host in self.hosts:
                 self._free_host(host)
-            
-        hosts = self.host_scanner.scan(iprange)
+
+        if args.quick:
+            hosts = self.host_scanner.quick_scan(iprange)
+            IO.ok('{} hosts found (quick scan).'.format(len(hosts)))
+        else:
+            hosts = self.host_scanner.scan(iprange)
 
         self.hosts_lock.acquire()
         self.hosts = hosts
         self.hosts_lock.release()
+
+        IO.spacer()
+
+    def _rescan_handler(self, args):
+        """
+        Handles 'rescan' command — rescans and merges new hosts
+        without losing status of existing hosts (spoofed/limited/blocked)
+        """
+        IO.ok('rescanning network (keeping existing host states)...')
+        new_hosts = self.host_scanner.scan()
+
+        with self.hosts_lock:
+            existing_macs = {h.mac.lower(): h for h in self.hosts}
+            added_count = 0
+
+            for new_host in new_hosts:
+                mac = new_host.mac.lower()
+                if mac in existing_macs:
+                    existing = existing_macs[mac]
+                    # update IP if changed (device got new DHCP lease)
+                    if existing.ip != new_host.ip:
+                        old_ip = existing.ip
+                        existing.ip = new_host.ip
+                        IO.ok('host {} IP changed: {} -> {}'.format(
+                            mac, old_ip, new_host.ip))
+                    # update hostname/vendor if we got better info
+                    if new_host.name and not existing.name:
+                        existing.name = new_host.name
+                    if new_host.vendor and not existing.vendor:
+                        existing.vendor = new_host.vendor
+                else:
+                    # new host discovered
+                    self.hosts.append(new_host)
+                    added_count += 1
+
+            IO.ok('{} new hosts added, {} total hosts.'.format(added_count, len(self.hosts)))
 
         IO.spacer()
 
@@ -616,11 +660,16 @@ class MainMenu(CommandMenu):
 
         IO.print(
             """
-{y}scan (--range [IP range]){r}{}scans for online hosts on your network.
-{s}required to find the hosts you want to limit.
+{y}scan (--range [IP range]) (--quick){r}{}scans for online hosts using deep multi-pass scan.
+{s}ICMP ping sweep + ARP table + multiple ARP passes.
+{s}use --quick for fast single-pass ARP scan.
 {b}{s}e.g.: scan
+{s}      scan --quick
 {s}      scan --range 192.168.178.1-192.168.178.50
 {s}      scan --range 192.168.178.1/24{r}
+
+{y}rescan{r}{}rescans & merges new hosts without losing
+{s}existing host states (spoofed/limited/blocked).
 
 {y}hosts (--force){r}{}lists all scanned hosts.
 {s}contains host information, including IDs.
@@ -667,7 +716,8 @@ class MainMenu(CommandMenu):
 
 {y}quit{r}{}quits the application.
             """.format(
-                    spaces[len('scan (--range [IP range])'):],
+                    spaces[len('scan (--range [IP range]) (--quick)'):],
+                    spaces[len('rescan'):],
                     spaces[len('hosts (--force)'):],
                     spaces[len('limit [ID1,ID2,...] [rate]'):],
                     spaces[len('      (--upload) (--download)'):],
