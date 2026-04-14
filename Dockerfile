@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpcap-dev \
     gcc \
     python3-dev \
+    sudo \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m -s /bin/bash appuser
