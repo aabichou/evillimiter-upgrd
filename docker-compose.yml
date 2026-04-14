@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  evillimiter:
+    build: .
+    container_name: evillimiter
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    network_mode: host
+    stdin_open: true
+    tty: true
+    privileged: true
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./config:/root/.config/evillimiter:rw
+    tmpfs:
+      - /dev/shm:rw
