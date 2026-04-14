@@ -20,8 +20,9 @@ COPY . /app/
 
 RUN pip install --no-cache-dir .
 
-RUN mkdir -p /var/log/tc /var/run/tc && chown -R appuser:appuser /app
+RUN mkdir -p /var/log/tc /var/run/tc
 
-USER appuser
+ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
+# Keep root for iptables/tc access
 CMD ["evillimiter", "-h"]
